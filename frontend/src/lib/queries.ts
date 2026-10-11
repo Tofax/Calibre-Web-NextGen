@@ -3,6 +3,7 @@ import type { ReaderFontCatalog } from './readerFonts';
 import { keepPreviousData, useQuery, useInfiniteQuery, useMutation, useQueryClient, useIsMutating } from '@tanstack/react-query';
 import type { QueryClient } from '@tanstack/react-query';
 import { useEffect } from 'react';
+import { refreshBookCoverViews } from './bookCoverCache';
 import {
   apiGet, apiPost, apiPut, apiDelete, apiUpload, apiPostForm, apiPostDownload, ApiError,
   navigateToLogout, noteSessionIdentity, TASK_FINISHED,
@@ -501,12 +502,7 @@ export function useClearMyCover(bookId: string | number) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => apiDelete(`/api/v1/books/${bookId}/my-cover`),
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: ['book', String(bookId)] });
-      void qc.invalidateQueries({ queryKey: ['books'] });
-      void qc.invalidateQueries({ queryKey: ['global-library'] });
-      void qc.invalidateQueries({ queryKey: ['cover-state', String(bookId)] });
-    },
+    onSuccess: () => refreshBookCoverViews(qc, bookId),
   });
 }
 
@@ -973,6 +969,7 @@ export interface MailConfig {
   mail_login: string;
   mail_from: string;
   mail_size_mb: number;
+  mail_filename_template: string;
   mail_server_type: number;
   has_password: boolean;
 }
@@ -1503,10 +1500,7 @@ export function useSetCover(id: string | number) {
       }
       return apiPost<{ ok: boolean; cover_url: string }>(`/api/v1/books/${id}/cover`, { url: v.url });
     },
-    onSuccess: () => {
-      void qc.invalidateQueries({ queryKey: ['book', String(id)] });
-      void qc.invalidateQueries({ queryKey: ['books'] });
-    },
+    onSuccess: () => refreshBookCoverViews(qc, id),
   });
 }
 
