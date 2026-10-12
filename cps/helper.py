@@ -464,6 +464,7 @@ def convert_book_format(book_id, calibre_path, old_book_format, new_book_format,
             subject = _('Send to eReader')
         settings['subject'] = subject
         settings['body'] = get_email_body_text()
+        settings['attachment_name'] = get_send_filename(book, new_book_format)
     else:
         settings = dict()
     link = '<a href="{}">{}</a>'.format(url_for('web.show_book', book_id=book.id), escape(book.title))  # prevent xss
@@ -605,6 +606,24 @@ def get_sendable_book(book_id, user=None):
     )
 
 
+def get_send_filename(book, book_format):
+    """Snapshot the outgoing name independently of the stored source file."""
+    template = getattr(config, "mail_filename_template", "") or ""
+    try:
+        if not template.strip():
+            return None
+        basename = render_opds_filename(
+            template, book, calibre_db.session,
+            unicode_filename=bool(config.config_unicode_filename),
+            ordered_authors=calibre_db.order_authors([book]), sort_names=False,
+        )
+        return basename + "." + book_format.lower()
+    except (ValueError, TypeError, AttributeError, SQLAlchemyError, OverflowError, RecursionError):
+        # A stale or externally edited setting must not prevent book delivery.
+        log.warning("Invalid eReader attachment filename template; retaining library name")
+        return None
+
+
 def send_mail(book_id, book_format, convert, ereader_mail, calibrepath, user_id,
               subject=None, user=None):
     """Send email with attachments"""
@@ -651,7 +670,8 @@ def send_mail(book_id, book_format, convert, ereader_mail, calibrepath, user_id,
                 WorkerThread.add(user_id, TaskEmail(subject, book.path, converted_file_name,
                                                     config.get_mail_settings(), email,
                                                     email_text, get_email_body_text(), book.id,
-                                                    cover_user_id=cover_user_id))
+                                                    cover_user_id=cover_user_id,
+                                                    attachment_name=get_send_filename(book, book_format)))
             return None
     return _("The requested file could not be read. Maybe wrong permissions?")
 
@@ -1456,6 +1476,15 @@ def delete_book_file(book, calibrepath, book_format=None):
                    id=book.id,
                    path=book.path)
 
+def _same_filesystem_entry(first, second):
+    """True when two path spellings name one file or folder, e.g. a case-only
+    rename on a case-insensitive filesystem (APFS, NTFS, exFAT, SMB)."""
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        return False
+
+
 def rename_all_files_on_change(one_book, new_path, old_path, all_new_name, gdrive=False):
     for file_format in one_book.data:
         if not gdrive:
@@ -1482,8 +1511,11 @@ def rename_all_files_on_change(one_book, new_path, old_path, all_new_name, gdriv
                     log.error("Neither old nor new file exists - cannot rename %s to %s", old_file, new_file)
                     continue
             
-            # Check if destination already exists
-            if os.path.exists(new_file) and old_file != new_file:
+            # Check if destination already exists. On a case-insensitive filesystem a
+            # case-only rename "finds" the source itself there; removing it would
+            # delete the only copy of the book (#2559).
+            same_entry = _same_filesystem_entry(old_file, new_file)
+            if os.path.exists(new_file) and not same_entry:
                 log.warning("Destination file already exists, will overwrite: %s", new_file)
                 try:
                     os.remove(new_file)
@@ -1496,6 +1528,10 @@ def rename_all_files_on_change(one_book, new_path, old_path, all_new_name, gdriv
                 log.debug("Successfully renamed %s to %s", old_file, new_file)
             except OSError as ex:
                 log.error("Failed to rename file from %s to %s: %s", old_file, new_file, ex)
+                if same_entry:
+                    # The file is still in place under its old name; a copy onto
+                    # itself would gain nothing, so keep the old name in the database.
+                    continue
                 # Try copy+delete as fallback for permission issues (e.g., network shares,
                 # cross-ownership bind mounts — janeczku/calibre-web#3437).
                 try:
@@ -1675,6 +1711,13 @@ def move_files_on_change(calibre_path, new_author_dir, new_titledir, localbook, 
                     except (OSError, IOError) as fallback_ex:
                         log.error("Copy tree fallback also failed: %s", fallback_ex)
                         raise
+            elif _same_filesystem_entry(path, new_path):
+                # Case-only rename on a case-insensitive filesystem: the "existing"
+                # folder is this book's own folder, so rename it in place (#2559).
+                # A rename through a temporary name is unsafe here: Docker Desktop's
+                # bind mount can report the second step as done without doing it.
+                log.debug("Renaming title folder in place: %s to %s", path, new_path)
+                os.rename(path, new_path)
             else:  # path is valid copy only files to new location (merge)
                 log.info("Moving title: %s into existing: %s", path, new_path)
                 # Take all files and subfolder from old path (strange command)
