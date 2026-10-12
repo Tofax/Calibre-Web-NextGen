@@ -48,12 +48,14 @@ from urllib.parse import quote
 from ...services import SyncToken as SyncToken, hardcover
 from ...services import (device_capabilities, device_delivery,
                          device_reading_position as device_positions)
+from ...services.place_arbiter import Report, report_wins
+from ...services.share_place import gates_enforced
 from ...kobo import push_reading_state_to_hardcover
 
-from flask import Blueprint, request, jsonify, send_from_directory
+from flask import Blueprint, g, has_request_context, request, jsonify, send_from_directory
 from flask_babel import gettext as _
 from werkzeug.security import check_password_hash
-from sqlalchemy import func, desc, cast, String
+from sqlalchemy import func, desc, cast, select, String
 from sqlalchemy.exc import SQLAlchemyError, OperationalError, InvalidRequestError
 from werkzeug.exceptions import BadRequest, HTTPException
 
@@ -622,7 +624,34 @@ def read_status_for_percentage(percentage: float) -> int:
     return ub.ReadBook.STATUS_UNREAD
 
 
-def update_book_read_status(user, book_id: int, percentage: float):
+def _hold_feed_clock(reading_state_id, *, moved):
+    """Keep the shared feed clock where an accepted checked mirror left it.
+
+    ``write_shared_bookmark`` moved it strictly past every Kobo's frontier.
+    The status helper and the ORM flush hook that follow in this request
+    stamp the parent with ``g.kobo_reading_state_lm`` (else the server's
+    now, which can trail a frontier set by a fast or legacy future clock),
+    so that clock is set for the rest of the request: never below the
+    stored one, and one step past it when this report did not move it.
+    """
+    from ...services.kobo_place_gate import FEED_STEP
+    stored = ub.session.execute(
+        select(ub.KoboReadingState.last_modified)
+        .where(ub.KoboReadingState.id == reading_state_id)
+    ).scalar()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if stored is None:
+        feed = now
+    else:
+        if stored.tzinfo is not None:
+            stored = stored.astimezone(timezone.utc).replace(tzinfo=None)
+        feed = max(now, stored if moved else stored + FEED_STEP)
+    if has_request_context():
+        g.kobo_reading_state_lm = feed.replace(tzinfo=timezone.utc)
+
+
+def update_book_read_status(user, book_id: int, percentage: float, *,
+                            shared_accepted=False, client_at=None):
     """
     Update the user's ReadBook status based on reading progress percentage.
 
@@ -644,6 +673,16 @@ def update_book_read_status(user, book_id: int, percentage: float):
 
     Raises:
         SQLAlchemyError: If database operation fails
+
+    Share my place: ``shared_accepted=True`` means the KOSync gate already
+    accepted this checked writer's report onto the shared place. It is then
+    arbitrated latest-wins against the Kobo bookmark by ``client_at`` (the
+    report's client clock) and the server receipt
+    (``kobo_place_gate.write_shared_bookmark``), so a deliberate backward
+    move reaches the Kobo bookmark as a percentage, a newer Kobo report is
+    not overwritten, and the Kobo feed clock moves past every Kobo's
+    frontier. The bookmark's Location is left as it is (exact
+    span is PR 3b). Every other caller keeps the forward-only percentage.
 
     Note:
         Caller is responsible for committing the session.
@@ -682,12 +721,23 @@ def update_book_read_status(user, book_id: int, percentage: float):
     # primary key. First-write races remain contained by each caller's existing
     # savepoint/transaction boundary; position acceptance itself is SQL-only.
     ub.session.flush()
-    outcome = device_positions.advance_kobo_bookmark(
-        bookmark,
-        percentage,
-        clock_accepts=False,
-        session=ub.session,
-    )
+    if shared_accepted:
+        from ...services.kobo_place_gate import write_shared_bookmark
+        outcome = write_shared_bookmark(
+            bookmark.id, client_at=client_at, progress_percent=percentage,
+            session=ub.session,
+        )
+        ub.session.expire(bookmark)
+        if reading_state is not None:
+            ub.session.expire(reading_state)
+        _hold_feed_clock(bookmark.kobo_reading_state_id, moved=outcome.accepted)
+    else:
+        outcome = device_positions.advance_kobo_bookmark(
+            bookmark,
+            percentage,
+            clock_accepts=False,
+            session=ub.session,
+        )
     if outcome.percentage is None:
         # The primitive could not find a row that survived arbitration. Do not
         # derive status, counters, or custom-column state from the proposal.
@@ -1048,6 +1098,7 @@ def _conditional_kosync_progress(
         "device": device,
         "device_id": device_id,
         "timestamp": timestamp,
+        "client_modified_at": None,
     }
     return device_positions.conditional_position_update(
         model=KOSyncProgress,
@@ -1061,6 +1112,7 @@ def _conditional_kosync_progress(
             "device": device,
             "device_id": device_id,
             "timestamp": timestamp,
+            "client_modified_at": None,
         },
         insert_values=payload,
         conflict_columns=(
@@ -1127,7 +1179,8 @@ def auth_user():
     user = authenticate_user()
     if user:
         return create_sync_response({"authorized": "OK",
-                                     "capabilities": list(SERVER_CAPABILITIES)})
+                                     "capabilities": list(SERVER_CAPABILITIES),
+                                     "share_place_gates": gates_enforced(user.id)})
     else:
         return create_sync_response({
             "error": ERROR_UNAUTHORIZED_USER,
@@ -1195,12 +1248,31 @@ def get_progress(document: str):
         # candidate set entirely, rather than returned with a null progress it
         # would report as a sync error.
         accepts_percentage = client_accepts_percentage_only()
-        progress_record = get_progress_record(
-            user.id, document, book_id,
-            include_percentage_only=accepts_percentage,
-        )
+        from ...services import kosync_place
+        target, identified, raw_id = kosync_place.request_device(user.id)
+        identified = identified and gates_enforced(user.id)
+        own_served = False
+        private = identified and not target.share_place
+        if identified and book_id:
+            own = kosync_place.own_position(target.id, book_id)
+            progress_record = None if private else get_progress_record(user.id, document, book_id)
+            if own is not None and own.progress_percent is not None and (
+                    private or progress_record is None or report_wins(
+                        kosync_place.position_report(own),
+                        kosync_place.shared_report(progress_record))):
+                progress_record = kosync_place.own_record(target, own, raw_id, document)
+                own_served = True
+            if progress_record is not None and is_percentage_only(progress_record) and not accepts_percentage:
+                return create_sync_response({POSITION_KINDS_AVAILABLE_FIELD: [POSITION_KIND_PERCENTAGE]})
+        else:
+            progress_record = get_progress_record(
+                user.id, document, book_id,
+                include_percentage_only=accepts_percentage,
+            )
 
         if not progress_record:
+            if private and book_id:
+                return create_sync_response({})
             # A miss and a withheld position looked identical on the wire, which
             # is what sent @sroebert to our source to find the parameter (#1445).
             return create_sync_response(_withheld_position_hint(
@@ -1215,7 +1287,7 @@ def get_progress(document: str):
         # The sentinel is an internal marker, never a position — send null
         # so no client can mistake it for an xpointer.
         progress_value = None if percentage_only else progress_record.progress
-        if percentage_only and book_id:
+        if percentage_only and book_id and not own_served:
             # The web reader's or Kobo's own place, when it can be expressed
             # exactly in the very file this device holds (#324); otherwise the
             # percentage.
@@ -1237,7 +1309,8 @@ def get_progress(document: str):
         }
 
         response_data = {**response_data, **response_updates}
-        if book_id and POSITION_KIND_ANCHOR in _advertised_position_kinds():
+        if (book_id and POSITION_KIND_ANCHOR in _advertised_position_kinds()
+                and not (own_served and percentage_only)):
             anchor = _anchor_for_record(user, book_id, progress_record)
             if anchor:
                 response_data["anchor"] = anchor
@@ -2330,95 +2403,140 @@ def update_progress():
                         placed_percent = max(placed_percent, percentage_float)
                     percentage_float = placed_percent
 
-        # Prefer the book_id as the identifier (if we have it) to ensure that all documents associated with the same
-        # Calibre book share the same progress record even if they have different checksums.
+        from ...services import kosync_place
+        target, identified, raw_id = kosync_place.request_device(user.id, data, observe=True)
+        internal_device_id = target.id if target is not None else None
+        # Unmatched documents cannot have a book journal. They and failed or
+        # capped registrations retain the legacy shared path.
+        gated = gates_enforced(user.id) and identified and bool(book_id)
+        private = gated and not target.share_place
         canonical_document = str(book_id or document)
+        proposed_percentage = percentage_float
+        shared_accepted = False
+        if gated:
+            user_id = user.id
+            device_id = raw_id
+            device = request.headers.get("X-CWNG-Device-Name") or device
+            report = Report(kosync_place.client_clock(data.get("timestamp"), received_at), received_at)
+            kosync_place.journal(target.id, book_id, journal_document,
+                                 journal_progress, proposed_percentage, report)
+            if not private:
+                current = get_progress_record(user.id, document, book_id)
+                # Converge a legacy checksum key before judging the report.
+                if current is not None and current.document != canonical_document:
+                    kosync_place.latest_write(
+                        KOSyncProgress, dict(user_id=user.id, document=canonical_document),
+                        dict(progress=current.progress, percentage=current.percentage,
+                             device=current.device, device_id=current.device_id,
+                             timestamp=current.timestamp,
+                             client_modified_at=current.client_modified_at),
+                        client_column="client_modified_at", server_column="timestamp",
+                        candidate=kosync_place.shared_report(current))
+                shared_accepted = kosync_place.latest_write(
+                    KOSyncProgress, dict(user_id=user.id, document=canonical_document),
+                    dict(progress=stored_progress, percentage=proposed_percentage,
+                         device=device, device_id=device_id, timestamp=received_at,
+                         client_modified_at=report.client_at),
+                    client_column="client_modified_at", server_column="timestamp", candidate=report)
+                if shared_accepted:
+                    # Retaining an older furthest checksum row would resurrect
+                    # it on the next legacy GET after a checked backward move.
+                    keys = set(get_book_checksums(book_id)) | {reported_document}
+                    keys.discard(canonical_document)
+                    ub.session.query(KOSyncProgress).filter(
+                        KOSyncProgress.user_id == user.id,
+                        KOSyncProgress.document.in_(keys),
+                    ).delete(synchronize_session=False)
+                    # Keep the derived graph in the accepted shared write's
+                    # transaction. A later report must not commit its carrier
+                    # and then have this report overwrite its Kobo mirror.
+                    try:
+                        with ub.begin_contained_nested(ub.session):
+                            update_book_read_status(user, book_id, proposed_percentage,
+                                                    shared_accepted=True,
+                                                    client_at=report.client_at)
+                    except Exception:
+                        log.warning("Could not mirror accepted shared place for book %s",
+                                    book_id, exc_info=True)
+            try:
+                ub.session.commit()
+            except SQLAlchemyError as e:
+                ub.session.rollback()
+                log.error(
+                    "Failed to commit kosync_progress for user=%s document=%s: %s",
+                    user_id, canonical_document, e,
+                )
+                raise KOSyncError(ERROR_INTERNAL, "Failed to save sync progress")
+            survived = (kosync_place.own_position(target.id, book_id) if private else
+                        ub.session.query(KOSyncProgress).filter_by(
+                            user_id=user.id, document=canonical_document).first())
+            timestamp = survived.server_modified_at if private else survived.timestamp
+            percentage_float = survived.progress_percent if private else survived.percentage
+            response_data["timestamp"] = int(kosync_place.utc(timestamp).timestamp())
+        else:
+            # #633 legacy convergence remains a key-resolution read, not an
+            # acceptance decision. Seed the canonical key through the same SQL
+            # primitive so an already-existing canonical row can only move forward.
+            # Legacy checksum rows are retained for compatibility; all current
+            # writers target the unique canonical key from this point onward.
+            progress_record = get_progress_record(user.id, document, book_id)
+            if (progress_record is not None
+                    and str(progress_record.document) != canonical_document):
+                _conditional_kosync_progress(
+                    user_id=user.id,
+                    document=canonical_document,
+                    progress=progress_record.progress,
+                    percentage=progress_record.percentage,
+                    device=progress_record.device,
+                    device_id=progress_record.device_id,
+                    timestamp=progress_record.timestamp,
+                    equal_accepts=(
+                        progress_record.progress != PERCENTAGE_ONLY_LOCATOR
+                    ),
+                )
 
-        # #633 legacy convergence remains a key-resolution read, not an
-        # acceptance decision. Seed the canonical key through the same SQL
-        # primitive so an already-existing canonical row can only move forward.
-        # Legacy checksum rows are retained for compatibility; all current
-        # writers target the unique canonical key from this point onward.
-        progress_record = get_progress_record(user.id, document, book_id)
-        if (progress_record is not None
-                and str(progress_record.document) != canonical_document):
-            _conditional_kosync_progress(
+            proposed_percentage = percentage_float
+            outcome = _conditional_kosync_progress(
                 user_id=user.id,
                 document=canonical_document,
-                progress=progress_record.progress,
-                percentage=progress_record.percentage,
-                device=progress_record.device,
-                device_id=progress_record.device_id,
-                timestamp=progress_record.timestamp,
-                equal_accepts=(
-                    progress_record.progress != PERCENTAGE_ONLY_LOCATOR
-                ),
+                progress=stored_progress,
+                percentage=percentage_float,
+                device=device,
+                device_id=device_id,
+                timestamp=timestamp,
+                # An unplaced percentage at the same percentage as another
+                # device's exact locator must not replace it with less.
+                equal_accepts=stored_progress != PERCENTAGE_ONLY_LOCATOR,
+                same_device_rewind=True,
             )
+            if not outcome.accepted:
+                log.info(
+                    "Preserved furthest kosync progress: user=%s, document=%s, "
+                    "incoming=%.2f%%, accepted=%.2f%%, incoming_device_id=%r",
+                    user.id, canonical_document, proposed_percentage,
+                    outcome.percentage, device_id,
+                )
+            percentage_float = outcome.percentage
+            timestamp = _aware_datetime(outcome.clock) or timestamp
+            document = canonical_document
+            response_data["timestamp"] = int(timestamp.timestamp())
 
-        proposed_percentage = percentage_float
-        outcome = _conditional_kosync_progress(
-            user_id=user.id,
-            document=canonical_document,
-            progress=stored_progress,
-            percentage=percentage_float,
-            device=device,
-            device_id=device_id,
-            timestamp=timestamp,
-            # An unplaced percentage at the same percentage as another
-            # device's exact locator must not replace it with less.
-            equal_accepts=stored_progress != PERCENTAGE_ONLY_LOCATOR,
-            same_device_rewind=True,
-        )
-        if not outcome.accepted:
-            log.info(
-                "Preserved furthest kosync progress: user=%s, document=%s, "
-                "incoming=%.2f%%, accepted=%.2f%%, incoming_device_id=%r",
-                user.id, canonical_document, proposed_percentage,
-                outcome.percentage, device_id,
-            )
-        percentage_float = outcome.percentage
-        timestamp = _aware_datetime(outcome.clock) or timestamp
-        document = canonical_document
-        response_data["timestamp"] = int(timestamp.timestamp())
-
-        # CRITICAL: Always commit kosync_progress first before attempting ReadBook updates
-        # This ensures sync location is persisted even if ReadBook update fails
-        try:
-            ub.session.commit()
-            log.info(f"Saved kosync progress: user={user.id}, document={document}, "
-                    f"progress={percentage_float:.2f}%")
-        except SQLAlchemyError as e:
-            # Fork issue #312: include user and document in the
-            # message so a triage sweep can correlate this with the
-            # client that's failing to sync.
-            log.error(
-                "Failed to commit kosync_progress for user=%s document=%s: %s",
-                getattr(user, "id", "?"), document, e,
-            )
-            ub.session.rollback()
-            raise KOSyncError(ERROR_INTERNAL, "Failed to save sync progress")
-
-        # Progress-only clients never reach the inventory, delivery, capability,
-        # or annotation paths that otherwise register their KOReader identity.
-        # Observe it only after the progress transaction is durable, and keep
-        # this optional side effect outside that session and outside the endpoint
-        # contract. A missing device_id has no stable identity to fingerprint.
-        if device_id:
-            internal_device_id = None
+            # CRITICAL: Always commit kosync_progress first before attempting ReadBook updates
+            # This ensures sync location is persisted even if ReadBook update fails
             try:
-                from ...services.device_registry import (
-                    register_koreader_device_best_effort,
+                ub.session.commit()
+                log.info(f"Saved kosync progress: user={user.id}, document={document}, "
+                        f"progress={percentage_float:.2f}%")
+            except SQLAlchemyError as e:
+                # Fork issue #312: include user and document in the
+                # message so a triage sweep can correlate this with the
+                # client that's failing to sync.
+                log.error(
+                    "Failed to commit kosync_progress for user=%s document=%s: %s",
+                    getattr(user, "id", "?"), document, e,
                 )
-                internal_device_id = register_koreader_device_best_effort(
-                    user_id=user.id,
-                    device_id=device_id,
-                    device_name=device,
-                )
-            except Exception:
-                log.warning(
-                    "Best-effort KOReader device registration from progress failed",
-                    exc_info=True,
-                )
+                ub.session.rollback()
+                raise KOSyncError(ERROR_INTERNAL, "Failed to save sync progress")
             if internal_device_id and book_id:
                 _journal_koreader_report(
                     user.id, internal_device_id, book_id, journal_document,
@@ -2429,18 +2547,18 @@ def update_progress():
         # This is done AFTER kosync_progress is committed, so sync location is always safe
         if book_id:
             try:
-                bookmark_outcome = update_book_read_status(
-                    user, book_id, percentage_float,
-                )
-                resolved_percentage = (
-                    bookmark_outcome.percentage
-                    if (bookmark_outcome is not None
-                        and bookmark_outcome.percentage is not None)
-                    else percentage_float
-                )
+                resolved_percentage = percentage_float
+                if not gated:
+                    bookmark_outcome = update_book_read_status(user, book_id, percentage_float)
+                    if bookmark_outcome is not None and bookmark_outcome.percentage is not None:
+                        resolved_percentage = bookmark_outcome.percentage
                 ub.session.commit()
-                log.info(f"Updated ReadBook status: user={user.id}, book={book_id} "
-                        f"({book_title}), status based on {resolved_percentage:.1f}%")
+                if gated:
+                    log.info("Recorded KOReader device reading: user=%s book=%s shared=%s progress=%.1f%%",
+                             user.id, book_id, shared_accepted, resolved_percentage)
+                else:
+                    log.info(f"Updated ReadBook status: user={user.id}, book={book_id} "
+                             f"({book_title}), status based on {resolved_percentage:.1f}%")
 
                 # Push to Hardcover
                 from ... import calibre_db
