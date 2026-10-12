@@ -360,7 +360,7 @@ msgid ""
 msgstr ""
 "Esteu segur que voleu suprimir la base de dades de sincronització de "
 "Calibre-Web NextGen per forçar una sincronització completa amb el vostre "
-"Kobo Reader?"
+"lector Kobo?"
 
 #: cps/admin.py cps/spa_strings.py cps/templates/modal_dialogs.html
 #: cps/templates/user_table.html
@@ -10912,7 +10912,7 @@ msgid ""
 "Your own cover is private to you and your e-reader deliveries. The library "
 "cover stays unchanged for everyone else."
 msgstr ""
-"La coberta que trieu només la veureu vós i s'inclourà en les còpies enviades"
+"Només veureu la coberta que trieu i s'inclourà en les còpies enviades"
 " als vostres lectors electrònics. La coberta de la biblioteca no canviarà "
 "per als altres usuaris."
 
@@ -19654,3 +19654,61 @@ msgstr "Mostra els prestatges seleccionats a OPDS"
 #: cps/templates/user_table.html
 msgid "Show Read/Unread Section"
 msgstr "Mostra la secció de llibres llegits i no llegits"
+
+#: cps/api/browse.py cps/opds.py cps/web.py
+msgid "Tag hierarchy temporarily unavailable. Please try again."
+msgstr "La jerarquia d'etiquetes no està disponible temporalment. Torneu-ho a provar més tard."
+
+#: cps/opds.py
+msgid "All books in this tag group"
+msgstr "Tots els llibres d'aquest grup d'etiquetes"
+
+#: cps/spa_strings.py
+msgid "Change Discover source"
+msgstr "Canvia la font de «Descobreix»"
+
+#: cps/spa_strings.py cps/templates/tag_tree.html
+msgid "All tags"
+msgstr "Totes les etiquetes"
+
+#: cps/spa_strings.py
+msgid "Could not load tags. Please try again."
+msgstr "No s'han pogut carregar les etiquetes. Torneu-ho a provar més tard."
+
+#: cps/spa_strings.py cps/templates/email_edit.html
+msgid "eReader attachment filename template"
+msgstr "Plantilla de nom de fitxer adjunt per al lector electrònic"
+
+#: cps/spa_strings.py cps/templates/email_edit.html
+msgid ""
+"Leave blank to keep the existing filename. Example: {series} #{series_index} "
+"- {title}. Fields include {title}, {authors}, {series} and {series_index}; the "
+"file extension is added automatically."
+msgstr ""
+"Deixeu en blanc el camp per mantenir el nom de fitxer actual. Exemple: {series} "
+"#{series_index} - {title}. Els camps inclouen {title}, {authors}, {series} i "
+"{series_index}; l'extensió del fitxer s'afegeix automàticament."
+
+#: cps/spa_strings.py cps/templates/email_edit.html
+msgid "Use {series:|(|) }{title} to omit the series prefix when no series is set."
+msgstr "Utilitzeu {series:|(|) }{title} per ometre el prefix de la sèrie quan no n'hi hagi cap."
+
+#: cps/spa_strings.py cps/templates/tag_tree.html
+msgid "Choose a tag group to browse books from it and its subtags."
+msgstr "Trieu un grup d'etiquetes per consultar-ne els llibres i les subetiquetes."
+
+#: cps/tag_hierarchy.py
+msgid "Unnamed tag"
+msgstr "Etiqueta sense nom"
+
+#: cps/services/mail_filename.py
+msgid "Use a valid attachment filename template with supported metadata fields."
+msgstr "Utilitzeu una plantilla de nom de fitxer adjunt vàlida amb camps de metadades compatibles."
+
+#: cps/templates/index.html
+msgid "Breadcrumb"
+msgstr "Ruta de navegació"
+
+#: cps/templates/index.html
+msgid "Subtags"
+msgstr "Subetiquetes"
