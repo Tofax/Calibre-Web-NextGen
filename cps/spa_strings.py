@@ -657,6 +657,25 @@ _("Custom display name")
 _("Custom fields on book cards")
 _("Display name for {name}")
 
+# Share my place (Devices page, spec 2026-10-11).
+_("Share my place")
+_("Devices with this on open each book where you last stopped on any of them. Turn it off for a device someone else reads on.")
+_("Could not save Share my place. Try again.")
+_("Always shares its place. Install or update the NextGen Sync plugin on this device to choose.")
+
+
+# Per-device book scope (KOReader, PR A).
+_("Books on this device")
+_("Same as my account setting")
+_("Everything in my library")
+_("Only these shelves")
+_("Choose which books this device keeps. Books you take off are removed from the device at its next sync; your place, highlights and notes stay saved.")
+_("The shelf chosen for this device was deleted. It uses your account setting until you choose again.")
+_("The shelf chosen for this device is no longer available. It uses your account setting until you choose again.")
+_("Account setting: {scope}")
+_("Could not save the book choice. Try again.")
+_("Saved.")
+
 # ==== BEGIN AUTOGEN (scripts/extract_spa_strings.py --write) ====
 # Auto-anchored SPA-only msgids — every t('literal') and static label
 # property in frontend/src that
@@ -2175,3 +2194,27 @@ _('Use {series:|(|) }{title} to omit the series prefix when no series is set.')
 
 # Built-in tag hierarchy; generic category wording remains for custom columns.
 _("Choose a tag group to browse books from it and its subtags.")
+
+# Per-device KOReader sleep-screen editor.
+_("Sleep screen")
+_("Sleep screen for {name}")
+_("Set sleep screen")
+_("Replace image")
+_("Remove sleep screen")
+_("Choose an image")
+_("Sleep screen preview for {name}")
+_("Shown when this device sleeps in KOReader.")
+_("The native Kindle lock screen is unchanged.")
+_("Waiting for next sync")
+_("Applied on device")
+_("Removal waiting for sync")
+_("Previous settings restored")
+_("Waiting for device details")
+_("Update the CWNG plugin")
+_("Update the CWNG plugin on this device, then sync.")
+_("Connect this device and use Sync now in KOReader.")
+_("This device cannot show a custom KOReader sleep screen.")
+_("Use a JPEG or PNG image up to 10 MiB.")
+_("Could not save sleep screen. Try again.")
+_("Could not apply sleep screen")
+_("Remove this image? Your previous KOReader sleep-screen settings will return after the next sync.")

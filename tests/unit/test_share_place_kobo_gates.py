@@ -68,14 +68,14 @@ GATES_ENV = "CWNG_SHARE_PLACE_GATES"
 def gates_enforced(monkeypatch):
     """Spec section 12: the gates enforce only when switched on. These tests
     pin the enforced behaviour, so every test here starts with the switch on
-    for every account; switch-off tests unset it themselves."""
+    for every account; switch-off tests set it to "0" themselves."""
     monkeypatch.setenv(GATES_ENV, "1")
 
 
 # == 0. The rollout switch (spec section 12) =================================
 
 def test_switch_off_an_unchecked_kobo_gets_todays_put_get_and_sync(kw, monkeypatch):
-    monkeypatch.delenv(GATES_ENV, raising=False)
+    monkeypatch.setenv(GATES_ENV, "0")
     one, two = kw.books[0], kw.books[1]
     kw.seed_shared(one, 20.0, _now() - timedelta(hours=2))
     kw.seed_shared(two, 45.0, _now() - timedelta(hours=2))
@@ -390,13 +390,17 @@ def test_turning_on_emits_the_shared_place_once_only_where_it_is_newer(kw):
     newer -> not emitted (no older shared place pushed onto a Kobo that read
     further while unchecked). Book 3: A never reported it -> the shared place
     is the only report, so it is emitted. Nothing is emitted twice and B sees
-    nothing from A's toggle."""
+    nothing from A's toggle. The shared places are checked B's, and both
+    Kobos provably hold each current KEPUB (completed downloads), so what is
+    emitted is B's exact span (spec 14c)."""
     one, two, three = kw.books
     now = _now()
+    kw.hold_current_kepub(kw.a, one, two, three)
+    kw.hold_current_kepub(kw.b, one, two, three)
     kw.share(kw.b, True)
-    kw.seed_shared(one, 70.0, now - timedelta(minutes=30))
-    kw.seed_shared(two, 30.0, now - timedelta(minutes=90))
-    kw.seed_shared(three, 45.0, now - timedelta(minutes=40))
+    kw.put(kw.b, one, 70.0, now - timedelta(minutes=30))
+    kw.put(kw.b, two, 30.0, now - timedelta(minutes=90))
+    kw.put(kw.b, three, 45.0, now - timedelta(minutes=40))
     kw.put(kw.a, one, 20.0, now - timedelta(minutes=90))
     kw.put(kw.a, two, 85.0, now - timedelta(minutes=30))
     kw.settle(kw.a)
@@ -410,7 +414,9 @@ def test_turning_on_emits_the_shared_place_once_only_where_it_is_newer(kw):
     assert [s["CurrentBookmark"]["ProgressPercent"] for s in delivered[one.uuid]] \
         == [70]
     assert delivered[one.uuid][0]["CurrentBookmark"]["Location"]["Value"] \
-        == "shared.70"
+        == "kobo.70.1"
+    assert delivered[three.uuid][0]["CurrentBookmark"]["Location"]["Value"] \
+        == "kobo.45.1"
     assert [s["CurrentBookmark"]["ProgressPercent"] for s in delivered[three.uuid]] \
         == [45]
     assert kw.shared(two) == shared_two  # A's newer own place did not leak out
